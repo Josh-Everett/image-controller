@@ -218,7 +218,7 @@ The key differences from the general purpose workflow are:
  - second robot account and the corresponding `RemoteSecret` and `Secret` are created with read (pull) only access to the image repository.
  - the pull secret is propagated into all `Application` environments via `RemoteSecret`.
  - the secret with write (push) credentials is linked to the pipeline service account, so the `Component` build pipeline can push resulting images.
- - the same push secret is linked to the integration pipeline service account `its-pipeline-<component>`, created by integration-service, so integration test pipelines of the `Component` can push attestations to the image repository. If that service account does not exist yet, it is skipped.
+ - the same push secret is linked to the integration pipeline service account `its-pipeline-<component>`, created by integration-service, so integration test pipelines of the `Component` can push attestations to the image repository. If that service account does not exist yet, it is skipped and linked when it appears.
 
 If `spec.image.name` is omitted, then instead of `ImageRepository` object name, `application-name/component-name` is used for the image repository name.
 

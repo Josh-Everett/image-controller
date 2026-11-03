@@ -971,6 +971,25 @@ var _ = Describe("Image repository controller", func() {
 			Expect(componentSa.Secrets).To(ContainElement(corev1.ObjectReference{Name: namespacePullSecretName}))
 		})
 
+		It("should link push secret into integration pipeline SA created after provision", func() {
+			// The steady-state reconcile calls only RepositoryExists, which BeforeEach stubs; reset to
+			// the permissive mock anyway, as the verify specs do.
+			quay.ResetTestQuayClient()
+
+			pushSecretName := fmt.Sprintf("%s-img-push", resourceKey.Name)
+			integrationSaKey := types.NamespacedName{Name: integrationSaName, Namespace: defaultNamespace}
+
+			// The account goes away, as it does when its Component is deleted and recreated.
+			deleteServiceAccount(integrationSaKey)
+			Eventually(func() bool {
+				return k8sClient.Get(ctx, integrationSaKey, &corev1.ServiceAccount{}) != nil
+			}, timeout, interval).Should(BeTrue())
+
+			// Nothing touches the ImageRepository; the ServiceAccount create event alone must link.
+			createServiceAccount(defaultNamespace, integrationSaName)
+			assertIntegrationSaLinked(pushSecretName)
+		})
+
 		// TODO: remove after all IRs are processed and all have new namespace pull ensured annotation
 		It("old already provisioned image repository without annotation will on next reconcile create namespace pull secret and robot account", func() {
 			// Delete the namespace secret to verify it gets recreated

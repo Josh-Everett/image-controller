@@ -36,13 +36,19 @@ import (
 	"github.com/konflux-ci/image-controller/pkg/quay"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 const (
@@ -112,6 +118,25 @@ func (r *ImageRepositoryReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// After migration: Replace entire function body with single line:
 	//   return ctrl.NewControllerManagedBy(mgr).For(&irv1alpha1.ImageRepository{}).Complete(r)
 
+	// Watch its-pipeline-<component> ServiceAccount create events and reconcile that component's
+	// ImageRepositories, so the push secret is linked when integration-service creates the account
+	// after the ImageRepository was provisioned. Create events only: the link itself happens in the
+	// ImageRepository's reconcile. The ServiceAccount informer already runs, because
+	// linkSecretToServiceAccount reads ServiceAccounts through the cached client; at every start it
+	// replays a create per existing account, and the map function reads from the cache, so that
+	// replay is in-memory work.
+	integrationSaCreated := predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool {
+			return strings.HasPrefix(e.Object.GetName(), integrationSaNamePrefix)
+		},
+		UpdateFunc:  func(event.UpdateEvent) bool { return false },
+		DeleteFunc:  func(event.DeleteEvent) bool { return false },
+		GenericFunc: func(event.GenericEvent) bool { return false },
+	}
+	// The manager cache serves ImageRepositories (For() runs their informers) even though the manager
+	// client bypasses the cache for them (getCacheExcludedObjectsTypes in cmd/main.go).
+	cacheReader := mgr.GetCache()
+
 	// Controller for new group (konflux-ci.dev)
 	newGroupReconciler := &ImageRepositoryReconciler{
 		Client:                     r.Client,
@@ -126,6 +151,10 @@ func (r *ImageRepositoryReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err := ctrl.NewControllerManagedBy(mgr).
 		Named("imagerepository-konflux").
 		For(&irv1alpha1.ImageRepository{}).
+		Watches(&corev1.ServiceAccount{},
+			handler.EnqueueRequestsFromMapFunc(imageRepositoriesForIntegrationSa(cacheReader,
+				func() client.ObjectList { return &irv1alpha1.ImageRepositoryList{} }, ComponentNameLabelName)),
+			builder.WithPredicates(integrationSaCreated)).
 		Complete(newGroupReconciler); err != nil {
 		return err
 	}
@@ -144,6 +173,10 @@ func (r *ImageRepositoryReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err := ctrl.NewControllerManagedBy(mgr).
 		Named("imagerepository-appstudio").
 		For(&imagerepositoryv1alpha1.ImageRepository{}).
+		Watches(&corev1.ServiceAccount{},
+			handler.EnqueueRequestsFromMapFunc(imageRepositoriesForIntegrationSa(cacheReader,
+				func() client.ObjectList { return &imagerepositoryv1alpha1.ImageRepositoryList{} }, ComponentNameLabelNameOldModel)),
+			builder.WithPredicates(integrationSaCreated)).
 		Complete(oldGroupReconciler); err != nil {
 		return err
 	}
@@ -611,7 +644,8 @@ func (r *ImageRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 
 		// link push secret to the component's integration pipeline SA (its-pipeline-<component>).
-		// integration-service creates that SA on its own schedule, so a missing one is not an error.
+		// integration-service creates that SA on its own schedule, so a missing one is not an error:
+		// the ServiceAccount watch in SetupWithManager reconciles this object when the SA appears.
 		// Secrets list only, never ImagePullSecrets, and no namespace pull secret for this SA.
 		if err := r.linkSecretToServiceAccount(ctx, integrationSaName, pushSecretName, imageRepository.Namespace, false, true); err != nil {
 			log.Error(err, "failed to link push secret to integration pipeline service account", "SaName", integrationSaName, "SecretName", pushSecretName, l.Action, l.ActionUpdate)
@@ -1528,6 +1562,44 @@ func getComponentSaName(componentName string) string {
 // getIntegrationSaName returns name of the per-component integration pipeline SA (its-pipeline-<component>)
 func getIntegrationSaName(componentName string) string {
 	return integrationSaNamePrefix + componentName
+}
+
+// imageRepositoriesForIntegrationSa returns the map function for the ServiceAccount watch: for an SA
+// named its-pipeline-<component> it enqueues every ImageRepository of the given kind in the SA's
+// namespace whose component label is <component>. newList builds an empty list of that kind and
+// componentLabel is that kind's label key. The read goes through the manager cache on purpose: the
+// manager client bypasses the cache for ImageRepositories (getCacheExcludedObjectsTypes in
+// cmd/main.go) and this runs once per existing account at every start.
+func imageRepositoriesForIntegrationSa(cacheReader client.Reader, newList func() client.ObjectList, componentLabel string) handler.MapFunc {
+	return func(ctx context.Context, serviceAccount client.Object) []reconcile.Request {
+		componentName := strings.TrimPrefix(serviceAccount.GetName(), integrationSaNamePrefix)
+		if componentName == "" {
+			return nil
+		}
+		log := ctrllog.FromContext(ctx).WithValues("ServiceAccountName", serviceAccount.GetName(), "Namespace", serviceAccount.GetNamespace())
+
+		imageRepositories := newList()
+		if err := cacheReader.List(ctx, imageRepositories, client.InNamespace(serviceAccount.GetNamespace()), client.MatchingLabels{componentLabel: componentName}); err != nil {
+			log.Error(err, "failed to list image repositories for integration pipeline service account", l.Action, l.ActionView)
+			return nil
+		}
+		items, err := meta.ExtractList(imageRepositories)
+		if err != nil {
+			log.Error(err, "failed to read image repositories list", l.Action, l.ActionView)
+			return nil
+		}
+
+		requests := make([]reconcile.Request, 0, len(items))
+		for _, item := range items {
+			imageRepository, err := meta.Accessor(item)
+			if err != nil {
+				log.Error(err, "failed to read image repository from list", l.Action, l.ActionView)
+				continue
+			}
+			requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: imageRepository.GetNamespace(), Name: imageRepository.GetName()}})
+		}
+		return requests
+	}
 }
 
 // ensureNamespacePullSecret ensures that namespace pull secret exists and add permissions for the image repository
