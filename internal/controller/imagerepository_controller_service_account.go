@@ -32,6 +32,8 @@ import (
 
 // linkSecretToServiceAccount ensures that the given secret is linked with the provided service account,
 // add also to ImagePullSecrets if requested
+//
+//nolint:unparam // addImagePullSecret is part of the helper's contract; every current caller links into Secrets only.
 func (r *ImageRepositoryReconciler) linkSecretToServiceAccount(ctx context.Context, saName, secretNameToAdd, namespace string, addImagePullSecret, notFoundOk bool) error {
 	log := ctrllog.FromContext(ctx).WithValues("ServiceAccountName", saName, "SecretName", secretNameToAdd)
 
@@ -243,11 +245,13 @@ func (r *ImageRepositoryReconciler) cleanUpSecretInServiceAccount(ctx context.Co
 func (r *ImageRepositoryReconciler) VerifyAndFixSecretsLinking(ctx context.Context, imageRepository *irv1alpha1.ImageRepository) error {
 	log := ctrllog.FromContext(ctx)
 
-	componentSaName := getComponentSaName(imageRepository.Labels[ComponentNameLabelName])
+	componentName := imageRepository.Labels[ComponentNameLabelName]
 	// remove after fully migrated to new group
 	if r.IsOldGroup {
-		componentSaName = getComponentSaName(imageRepository.Labels[ComponentNameLabelNameOldModel])
+		componentName = imageRepository.Labels[ComponentNameLabelNameOldModel]
 	}
+	componentSaName := getComponentSaName(componentName)
+	integrationSaName := getIntegrationSaName(componentName)
 
 	pushSecretName := imageRepository.Status.Credentials.PushSecretName
 
@@ -261,6 +265,16 @@ func (r *ImageRepositoryReconciler) VerifyAndFixSecretsLinking(ctx context.Conte
 		// clean duplicate secret links and remove secret from ImagePullSecrets
 		if err := r.cleanUpSecretInServiceAccount(ctx, componentSaName, pushSecretName, imageRepository.Namespace, false); err != nil {
 			log.Error(err, "failed to clean up secret in service account", "saName", componentSaName, "SecretName", pushSecretName, l.Action, l.ActionUpdate)
+			return err
+		}
+
+		// the same for the integration pipeline SA; a missing one is skipped, as on reconcile
+		if err := r.linkSecretToServiceAccount(ctx, integrationSaName, pushSecretName, imageRepository.Namespace, false, true); err != nil {
+			log.Error(err, "failed to link secret to integration pipeline service account", "saName", integrationSaName, "SecretName", pushSecretName, l.Action, l.ActionUpdate)
+			return err
+		}
+		if err := r.cleanUpSecretInServiceAccount(ctx, integrationSaName, pushSecretName, imageRepository.Namespace, false); err != nil {
+			log.Error(err, "failed to clean up secret in integration pipeline service account", "saName", integrationSaName, "SecretName", pushSecretName, l.Action, l.ActionUpdate)
 			return err
 		}
 	}

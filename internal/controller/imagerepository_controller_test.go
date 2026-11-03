@@ -414,6 +414,7 @@ var _ = Describe("Image repository controller", func() {
 		var resourceKey = types.NamespacedName{Name: defaultImageRepositoryName + "-componentprovision", Namespace: defaultNamespace}
 		var componentKey = types.NamespacedName{Name: defaultComponentName, Namespace: defaultNamespace}
 		var componentSaName = getComponentSaName(defaultComponentName)
+		var integrationSaName = getIntegrationSaName(defaultComponentName)
 
 		BeforeEach(func() {
 			quay.ResetTestQuayClientToFails()
@@ -436,15 +437,25 @@ var _ = Describe("Image repository controller", func() {
 			expectedNamespaceRobotAccountName = sanitizeNameForQuay(expectedNamespaceRobotAccountName)
 
 			createServiceAccount(defaultNamespace, componentSaName)
+			createServiceAccount(defaultNamespace, integrationSaName)
 
-			// wait for SA to be created
+			// wait for SAs to be created
 			Eventually(func() bool {
 				saList := getServiceAccountList(defaultNamespace)
-				// there will be 1 service account
-				// component SA
-				return len(saList) == 1
+				// there will be 2 service accounts
+				// component SA and integration pipeline SA
+				return len(saList) == 2
 			}, timeout, interval).WithTimeout(ensureTimeout).Should(BeTrue())
 		})
+
+		// The integration pipeline SA is linked by a second update in the same reconcile that links
+		// the component SA, a moment later, hence Eventually. It holds the push secret alone.
+		assertIntegrationSaLinked := func(pushSecretName string) {
+			Eventually(func() []corev1.ObjectReference {
+				return getServiceAccount(defaultNamespace, integrationSaName).Secrets
+			}, timeout, interval).Should(ConsistOf(corev1.ObjectReference{Name: pushSecretName}))
+			Expect(getServiceAccount(defaultNamespace, integrationSaName).ImagePullSecrets).To(BeEmpty())
+		}
 
 		assertProvisionRepository := func(updateComponentAnnotation, setNotification bool) {
 			quay.RepositoryExistsFunc = func(organization, imageRepository string) (bool, error) {
@@ -646,6 +657,8 @@ var _ = Describe("Image repository controller", func() {
 			Expect(componentSa.ImagePullSecrets).To(BeEmpty())
 			Expect(componentSa.Secrets).To(ContainElement(corev1.ObjectReference{Name: pushSecret.Name}))
 			Expect(componentSa.Secrets).To(ContainElement(corev1.ObjectReference{Name: namespacePullSecretName}))
+
+			assertIntegrationSaLinked(pushSecret.Name)
 		}
 
 		assertSecretsGoneFromServiceAccounts := func() {
@@ -653,6 +666,11 @@ var _ = Describe("Image repository controller", func() {
 			Expect(componentSa.Secrets).To(HaveLen(1))
 			Expect(componentSa.Secrets).To(ContainElement(corev1.ObjectReference{Name: namespacePullSecretName}))
 			Expect(componentSa.ImagePullSecrets).To(BeEmpty())
+
+			Eventually(func() []corev1.ObjectReference {
+				return getServiceAccount(defaultNamespace, integrationSaName).Secrets
+			}, timeout, interval).Should(BeEmpty())
+			Expect(getServiceAccount(defaultNamespace, integrationSaName).ImagePullSecrets).To(BeEmpty())
 		}
 
 		It("should provision image repository for component, without update component annotation", func() {
@@ -909,6 +927,9 @@ var _ = Describe("Image repository controller", func() {
 			componentSa := getServiceAccount(defaultNamespace, componentSaName)
 			componentSa.Secrets = []corev1.ObjectReference{}
 			Expect(k8sClient.Update(ctx, &componentSa)).To(Succeed())
+			integrationSa := getServiceAccount(defaultNamespace, integrationSaName)
+			integrationSa.Secrets = []corev1.ObjectReference{}
+			Expect(k8sClient.Update(ctx, &integrationSa)).To(Succeed())
 
 			imageRepository := getImageRepository(resourceKey)
 			verifyLinking := true
@@ -923,6 +944,7 @@ var _ = Describe("Image repository controller", func() {
 			Expect(componentSa.ImagePullSecrets).To(BeEmpty())
 			Expect(componentSa.Secrets).To(ContainElement(corev1.ObjectReference{Name: pushSecretName}))
 			Expect(componentSa.Secrets).To(ContainElement(corev1.ObjectReference{Name: namespacePullSecretName}))
+			assertIntegrationSaLinked(pushSecretName)
 		})
 
 		It("verify and fix, secret is duplicated in SA, also is in ImagePullSecrets", func() {
@@ -1061,6 +1083,7 @@ var _ = Describe("Image repository controller", func() {
 			assertSecretsGoneFromServiceAccounts()
 
 			deleteServiceAccount(types.NamespacedName{Name: componentSaName, Namespace: defaultNamespace})
+			deleteServiceAccount(types.NamespacedName{Name: integrationSaName, Namespace: defaultNamespace})
 		})
 	})
 

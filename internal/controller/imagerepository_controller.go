@@ -67,7 +67,12 @@ const (
 	waitForRelatedComponentInitialWindowDuration  = 2 * 60
 	waitForRelatedComponentFallbackWindowDuration = 60 * 60
 
-	componentSaNamePrefix                   = "build-pipeline-"
+	componentSaNamePrefix = "build-pipeline-"
+	// integrationSaNamePrefix is the prefix of the per-component ServiceAccount that integration test
+	// pipelines run as (its-pipeline-<component>). It must equal
+	// ComponentIntegrationPipelineServiceAccountPrefix in integration-service, tekton/consts/consts.go;
+	// the suffix is the Component's metadata name on both sides.
+	integrationSaNamePrefix                 = "its-pipeline-"
 	imageRepositoryNameChangedMessagePrefix = "Image repository name changed after creation"
 	imageRepositoryNameChangedMessageSuffix = "That doesn't change image name in the registry. To do that, delete ImageRepository object and re-create it with new image name."
 
@@ -313,13 +318,21 @@ func (r *ImageRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 
 			// unlink secret from component SA
-			componentSaName := getComponentSaName(imageRepository.Labels[ComponentNameLabelName])
+			componentName := imageRepository.Labels[ComponentNameLabelName]
 			// remove after fully migrated to new group
 			if r.IsOldGroup {
-				componentSaName = getComponentSaName(imageRepository.Labels[ComponentNameLabelNameOldModel])
+				componentName = imageRepository.Labels[ComponentNameLabelNameOldModel]
 			}
+			componentSaName := getComponentSaName(componentName)
 			if err := r.unlinkSecretFromServiceAccount(ctx, componentSaName, pushSecretName, imageRepository.Namespace); err != nil {
 				log.Error(err, "failed to unlink secret from service account", "SaName", componentSaName, "SecretName", pushSecretName, l.Action, l.ActionUpdate)
+				return ctrl.Result{}, err
+			}
+
+			// unlink secret from the component's integration pipeline SA; a missing SA is not an error
+			integrationSaName := getIntegrationSaName(componentName)
+			if err := r.unlinkSecretFromServiceAccount(ctx, integrationSaName, pushSecretName, imageRepository.Namespace); err != nil {
+				log.Error(err, "failed to unlink secret from integration pipeline service account", "SaName", integrationSaName, "SecretName", pushSecretName, l.Action, l.ActionUpdate)
 				return ctrl.Result{}, err
 			}
 
@@ -579,11 +592,13 @@ func (r *ImageRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	if isComponentLinked(imageRepository, r.IsOldGroup) {
 		// link push secret to component SA
 		pushSecretName := getSecretName(imageRepository, false, r.IsOldGroup)
-		componentSaName := getComponentSaName(imageRepository.Labels[ComponentNameLabelName])
+		componentName := imageRepository.Labels[ComponentNameLabelName]
 		// remove after fully migrated to new group
 		if r.IsOldGroup {
-			componentSaName = getComponentSaName(imageRepository.Labels[ComponentNameLabelNameOldModel])
+			componentName = imageRepository.Labels[ComponentNameLabelNameOldModel]
 		}
+		componentSaName := getComponentSaName(componentName)
+		integrationSaName := getIntegrationSaName(componentName)
 		if err := r.linkSecretToServiceAccount(ctx, componentSaName, pushSecretName, imageRepository.Namespace, false, false); err != nil {
 			log.Error(err, "failed to link push secret to component service account", "SaName", componentSaName, "SecretName", pushSecretName, l.Action, l.ActionUpdate)
 			return ctrl.Result{}, err
@@ -592,6 +607,14 @@ func (r *ImageRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		// link namespace pull secret to component SA
 		if err := r.linkSecretToServiceAccount(ctx, componentSaName, namespacePullSecretName, imageRepository.Namespace, false, false); err != nil {
 			log.Error(err, "failed to link namespace pull secret to component service account", "SaName", componentSaName, "SecretName", namespacePullSecretName, l.Action, l.ActionUpdate)
+			return ctrl.Result{}, err
+		}
+
+		// link push secret to the component's integration pipeline SA (its-pipeline-<component>).
+		// integration-service creates that SA on its own schedule, so a missing one is not an error.
+		// Secrets list only, never ImagePullSecrets, and no namespace pull secret for this SA.
+		if err := r.linkSecretToServiceAccount(ctx, integrationSaName, pushSecretName, imageRepository.Namespace, false, true); err != nil {
+			log.Error(err, "failed to link push secret to integration pipeline service account", "SaName", integrationSaName, "SecretName", pushSecretName, l.Action, l.ActionUpdate)
 			return ctrl.Result{}, err
 		}
 
@@ -1500,6 +1523,11 @@ func (r *ImageRepositoryReconciler) ImageRepositoryForSameUrlExists(ctx context.
 // getComponentSaName returns name of component SA
 func getComponentSaName(componentName string) string {
 	return fmt.Sprintf("%s%s", componentSaNamePrefix, componentName)
+}
+
+// getIntegrationSaName returns name of the per-component integration pipeline SA (its-pipeline-<component>)
+func getIntegrationSaName(componentName string) string {
+	return integrationSaNamePrefix + componentName
 }
 
 // ensureNamespacePullSecret ensures that namespace pull secret exists and add permissions for the image repository

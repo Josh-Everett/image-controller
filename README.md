@@ -159,7 +159,7 @@ When secret is removed by mistake, it can be recreated by removal of that annota
 
 ### Verify and fix secrets links
 
-It will link secret to service account if link is missing.
+It will link secret to service account if link is missing. Both the build pipeline service account `build-pipeline-<component>` and, when it exists, the integration pipeline service account `its-pipeline-<component>` are verified.
 It will remove duplicate links of secret in service account.
 It will remove secret from imagePullSecrets in service account.
 It's possible to request verification and fixing of secrets linking to service account by adding:
@@ -218,6 +218,7 @@ The key differences from the general purpose workflow are:
  - second robot account and the corresponding `RemoteSecret` and `Secret` are created with read (pull) only access to the image repository.
  - the pull secret is propagated into all `Application` environments via `RemoteSecret`.
  - the secret with write (push) credentials is linked to the pipeline service account, so the `Component` build pipeline can push resulting images.
+ - the same push secret is linked to the integration pipeline service account `its-pipeline-<component>`, created by integration-service, so integration test pipelines of the `Component` can push attestations to the image repository. If that service account does not exist yet, it is skipped.
 
 If `spec.image.name` is omitted, then instead of `ImageRepository` object name, `application-name/component-name` is used for the image repository name.
 
